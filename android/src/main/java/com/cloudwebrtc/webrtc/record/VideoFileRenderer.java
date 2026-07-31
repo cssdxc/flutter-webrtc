@@ -43,12 +43,16 @@ class VideoFileRenderer implements VideoSink, SamplesReadyCallback {
     private ByteBuffer[] audioOutputBuffers;
     private EglBase eglBase;
     private final EglBase.Context sharedContext;
+    private final boolean motionRecording;
     private VideoFrameDrawer frameDrawer;
 
-    // TODO: these ought to be configurable as well
     private static final String MIME_TYPE = "video/avc";    // H.264 Advanced Video Coding
-    private static final int FRAME_RATE = 30;               // 30fps
+    private static final int VIEWER_FRAME_RATE = 18;
+    private static final int MOTION_FRAME_RATE = 18;
+    private static final int MOTION_BITRATE = 300000;
+    private static final int[] VIEWER_BITRATES = {6000000, 4000000, 2000000, 1000000};
     private static final int IFRAME_INTERVAL = 5;           // 5 seconds between I-frames
+    private static final int MOTION_IFRAME_INTERVAL = 2;
 
     private final MediaMuxer mediaMuxer;
     private MediaCodec encoder;
@@ -76,6 +80,7 @@ class VideoFileRenderer implements VideoSink, SamplesReadyCallback {
         }
         bufferInfo = new MediaCodec.BufferInfo();
         this.sharedContext = sharedContext;
+        motionRecording = outputFile.contains(".motion_recording.mp4");
 
         // Create a MediaMuxer.  We can't add the video track and start() the muxer here,
         // because our MediaFormat doesn't have the Magic Goodies.  These can only be
@@ -90,8 +95,12 @@ class VideoFileRenderer implements VideoSink, SamplesReadyCallback {
             MediaFormat format = MediaFormat.createVideoFormat(MIME_TYPE, config.width, config.height);
             format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
             format.setInteger(MediaFormat.KEY_BIT_RATE, config.bitrate);
-            format.setInteger(MediaFormat.KEY_FRAME_RATE, FRAME_RATE);
-            format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, IFRAME_INTERVAL);
+            format.setInteger(
+                    MediaFormat.KEY_FRAME_RATE,
+                    motionRecording ? MOTION_FRAME_RATE : VIEWER_FRAME_RATE);
+            format.setInteger(
+                    MediaFormat.KEY_I_FRAME_INTERVAL,
+                    motionRecording ? MOTION_IFRAME_INTERVAL : IFRAME_INTERVAL);
 
             Log.d(TAG, "Trying encoder config: " + config);
 
@@ -131,6 +140,7 @@ class VideoFileRenderer implements VideoSink, SamplesReadyCallback {
             return true;
         }
         return !codecName.startsWith("OMX.qcom.")
+                && !codecName.startsWith("OMX.MTK.")
                 && !"OMX.hisi.video.encoder.avc".equals(codecName);
     }
 
@@ -159,7 +169,9 @@ class VideoFileRenderer implements VideoSink, SamplesReadyCallback {
 
     private List<EncoderConfig> getSupportedConfigurations(int frameWidth, int frameHeight) {
         
-        int[] bitrates = {6000000, 4000000, 2000000, 1000000};
+        int[] bitrates = motionRecording
+                ? new int[]{MOTION_BITRATE}
+                : VIEWER_BITRATES;
         int[] profiles = {
                 MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline,
                 MediaCodecInfo.CodecProfileLevel.AVCProfileMain,

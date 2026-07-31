@@ -93,12 +93,75 @@
         return;
     }
 
+    UInt32 channelCount = sourceDescription->mChannelsPerFrame > 0
+        ? sourceDescription->mChannelsPerFrame
+        : 1;
     AVAudioFrameCount frameLength = pcmBuffer.frameLength;
+    size_t sampleCount = (size_t)frameLength * channelCount;
+    NSMutableData *interleavedData =
+        [NSMutableData dataWithLength:sampleCount * sizeof(float)];
+    float *target = (float *)interleavedData.mutableBytes;
+    if (target == NULL) {
+        return;
+    }
+
+    // AVAssetWriter 需要布局明确且内存连续的 PCM。WebRTC 通常给出非交错
+    // Float32，不能直接把原 AudioBufferList 当成一段连续数据写入。
+    if (pcmBuffer.floatChannelData != NULL) {
+        if (pcmBuffer.format.isInterleaved) {
+            memcpy(target,
+                   pcmBuffer.floatChannelData[0],
+                   sampleCount * sizeof(float));
+        } else {
+            for (AVAudioFrameCount frame = 0; frame < frameLength; frame++) {
+                for (UInt32 channel = 0; channel < channelCount; channel++) {
+                    target[(size_t)frame * channelCount + channel] =
+                        pcmBuffer.floatChannelData[channel][frame];
+                }
+            }
+        }
+    } else if (pcmBuffer.int16ChannelData != NULL) {
+        if (pcmBuffer.format.isInterleaved) {
+            for (size_t sample = 0; sample < sampleCount; sample++) {
+                target[sample] =
+                    (float)pcmBuffer.int16ChannelData[0][sample] / 32768.0f;
+            }
+        } else {
+            for (AVAudioFrameCount frame = 0; frame < frameLength; frame++) {
+                for (UInt32 channel = 0; channel < channelCount; channel++) {
+                    target[(size_t)frame * channelCount + channel] =
+                        (float)pcmBuffer.int16ChannelData[channel][frame] /
+                        32768.0f;
+                }
+            }
+        }
+    } else {
+        if (!_loggedFormat) {
+            NSLog(@"[SUR-REC][ios] unsupported audio pcm buffer format flags=%u bits=%u channels=%u",
+                  (unsigned int)sourceDescription->mFormatFlags,
+                  (unsigned int)sourceDescription->mBitsPerChannel,
+                  (unsigned int)channelCount);
+            _loggedFormat = YES;
+        }
+        return;
+    }
+
+    AudioStreamBasicDescription streamDescription;
+    bzero(&streamDescription, sizeof(streamDescription));
+    streamDescription.mSampleRate = sourceDescription->mSampleRate;
+    streamDescription.mFormatID = kAudioFormatLinearPCM;
+    streamDescription.mFormatFlags =
+        kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
+    streamDescription.mBytesPerPacket = sizeof(float) * channelCount;
+    streamDescription.mFramesPerPacket = 1;
+    streamDescription.mBytesPerFrame = sizeof(float) * channelCount;
+    streamDescription.mChannelsPerFrame = channelCount;
+    streamDescription.mBitsPerChannel = 8 * sizeof(float);
 
     if (!_loggedFormat) {
         NSLog(@"[SUR-REC][ios] audio pcm sampleRate=%.0f channels=%u frames=%u sourceFlags=%u sourceBits=%u",
-              sourceDescription->mSampleRate,
-              (unsigned int)sourceDescription->mChannelsPerFrame,
+              streamDescription.mSampleRate,
+              (unsigned int)channelCount,
               (unsigned int)frameLength,
               (unsigned int)sourceDescription->mFormatFlags,
               (unsigned int)sourceDescription->mBitsPerChannel);
@@ -107,7 +170,7 @@
 
     CMAudioFormatDescriptionRef formatDesc = NULL;
     OSStatus formatStatus = CMAudioFormatDescriptionCreate(kCFAllocatorDefault,
-                                                            sourceDescription,
+                                                            &streamDescription,
                                                             0,
                                                             nil,
                                                             0,
@@ -122,7 +185,7 @@
     [self updateFormatIfNeeded:formatDesc];
 
     CMSampleBufferRef buffer = NULL;
-    CMSampleTimingInfo timing = [self nextAudioTimingWithSampleRate:(int)sourceDescription->mSampleRate
+    CMSampleTimingInfo timing = [self nextAudioTimingWithSampleRate:(int)streamDescription.mSampleRate
                                                      numberOfFrames:frameLength];
     OSStatus bufferStatus = CMSampleBufferCreate(kCFAllocatorDefault,
                                                   NULL,
@@ -137,13 +200,28 @@
                                                   NULL,
                                                   &buffer);
     OSStatus dataStatus = bufferStatus;
-    if (dataStatus == noErr && buffer != NULL) {
-        dataStatus = CMSampleBufferSetDataBufferFromAudioBufferList(
-            buffer,
-            kCFAllocatorDefault,
-            kCFAllocatorDefault,
-            kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
-            pcmBuffer.audioBufferList);
+    OSStatus blockStatus = noErr;
+    CMBlockBufferRef blockBuffer = NULL;
+    if (bufferStatus == noErr && buffer != NULL) {
+        blockStatus = CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault,
+                                                         NULL,
+                                                         interleavedData.length,
+                                                         kCFAllocatorDefault,
+                                                         NULL,
+                                                         0,
+                                                         interleavedData.length,
+                                                         0,
+                                                         &blockBuffer);
+        if (blockStatus == noErr && blockBuffer != NULL) {
+            blockStatus = CMBlockBufferReplaceDataBytes(target,
+                                                        blockBuffer,
+                                                        0,
+                                                        interleavedData.length);
+        }
+        dataStatus = blockStatus;
+        if (dataStatus == noErr && blockBuffer != NULL) {
+            dataStatus = CMSampleBufferSetDataBuffer(buffer, blockBuffer);
+        }
     }
     if (dataStatus == noErr && buffer != NULL) {
         dataStatus = CMSampleBufferSetDataReady(buffer);
@@ -153,13 +231,17 @@
     } else {
         _dataBufferErrorCount++;
         if (_dataBufferErrorCount <= 3 || _dataBufferErrorCount % 100 == 0) {
-            NSLog(@"[SUR-REC][ios] audio sample buffer create failed #%d createStatus=%d dataStatus=%d",
+            NSLog(@"[SUR-REC][ios] audio sample buffer create failed #%d createStatus=%d blockStatus=%d dataStatus=%d",
                   _dataBufferErrorCount,
                   (int)bufferStatus,
+                  (int)blockStatus,
                   (int)dataStatus);
         }
     }
 
+    if (blockBuffer != NULL) {
+        CFRelease(blockBuffer);
+    }
     if (buffer != NULL) {
         CFRelease(buffer);
     }

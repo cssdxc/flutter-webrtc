@@ -5,6 +5,10 @@
 
 @import AVFoundation;
 
+static const int kViewerRecordingFrameRate = 18;
+static const int kMotionRecordingFrameRate = 18;
+static const CMTimeScale kMotionRecordingTimeScale = 90000;
+
 @implementation FlutterRTCMediaRecorder {
     int framesCount;
     bool isInitialized;
@@ -19,10 +23,12 @@
     NSMutableArray<NSValue*>* _pendingAudioBuffers;
     int64_t _startTime;
     CMTime _motionRecordingStartTime;
+    CMTime _nextMotionVideoHostTime;
     CMTime _lastMotionVideoPresentationTime;
 }
 - (void)drainPendingAudioBuffers {
     while (!isStopping &&
+           self.assetWriter.status == AVAssetWriterStatusWriting &&
            _pendingAudioBuffers.count > 0 &&
            _audioWriter != nil &&
            _audioWriter.readyForMoreMediaData) {
@@ -84,6 +90,7 @@
         NSLog(@"Audio track is nil");
     _startTime = -1;
     _motionRecordingStartTime = kCMTimeInvalid;
+    _nextMotionVideoHostTime = kCMTimeInvalid;
     _lastMotionVideoPresentationTime = kCMTimeInvalid;
     return self;
 }
@@ -138,7 +145,11 @@
               self.writerInput.transform.c,
               self.writerInput.transform.d);
     }
-    self.writerInput.mediaTimeScale = isMotionRecording ? 18 : 18;
+    // Viewer 录像沿用原来的固定帧计数时间轴。Motion 录像使用高精度时间轴，
+    // 否则把本地约 30/36 FPS 的回调量化到 18 Hz 会把视频拉长成慢动作。
+    self.writerInput.mediaTimeScale = isMotionRecording
+        ? kMotionRecordingTimeScale
+        : kViewerRecordingFrameRate;
 
     if (_audioSink != nil) {
         const AudioStreamBasicDescription *sourceAudioDescription = NULL;
@@ -187,13 +198,31 @@
     [self.assetWriter addInput:self.writerInput];
     if (_audioWriter != nil) {
         [self.assetWriter addInput:_audioWriter];
+    }
+
+    BOOL didStartWriting = [self.assetWriter startWriting];
+    if (!didStartWriting) {
+        NSLog(@"[SUR-REC][ios] asset writer start failed error=%@",
+              self.assetWriter.error);
+        isInitialized = true;
+        return;
+    }
+    [self.assetWriter startSessionAtSourceTime:kCMTimeZero];
+
+    // 必须在 startSession 之后才开放音频回调，否则音频线程可能先于当前
+    // 线程 append，AVAssetWriter 会因尚未开始 session 直接抛出异常。
+    if (_audioWriter != nil) {
         _audioSink.bufferCallback = ^(CMSampleBufferRef buffer){
-            if (self->isStopping || self->_audioWriter == nil) {
+            if (self->isStopping ||
+                self->_audioWriter == nil ||
+                self.assetWriter.status != AVAssetWriterStatusWriting) {
                 return;
             }
             CFRetain(buffer);
             dispatch_async(self->_audioAppendQueue, ^{
-                if (self->isStopping || self->_audioWriter == nil) {
+                if (self->isStopping ||
+                    self->_audioWriter == nil ||
+                    self.assetWriter.status != AVAssetWriterStatusWriting) {
                     CFRelease(buffer);
                     return;
                 }
@@ -224,8 +253,6 @@
             });
         };
     }
-    [self.assetWriter startWriting];
-    [self.assetWriter startSessionAtSourceTime:kCMTimeZero];
     
     isInitialized = true;
 }
@@ -243,6 +270,38 @@
     if (!self.writerInput.readyForMoreMediaData) {
         NSLog(@"Drop frame, not ready");
         return;
+    }
+    BOOL isMotionRecording = [self.output.path containsString:@".motion_recording.mp4"];
+    CMTime motionNow = kCMTimeInvalid;
+    CMTime motionPresentationTime = kCMTimeInvalid;
+    if (isMotionRecording) {
+        motionNow = CMClockGetTime(CMClockGetHostTimeClock());
+        if (!CMTIME_IS_VALID(_motionRecordingStartTime)) {
+            _motionRecordingStartTime = motionNow;
+            _nextMotionVideoHostTime = motionNow;
+        }
+
+        // 本地摄像头可能忽略 getUserMedia 的 maxFrameRate，主动限制 Motion
+        // 写入为 18 FPS。5 ms 容差避免 36 FPS 输入因调度抖动误降为 12 FPS。
+        CMTime schedulingTolerance = CMTimeMake(1, 200);
+        if (CMTIME_IS_VALID(_nextMotionVideoHostTime) &&
+            CMTimeCompare(CMTimeAdd(motionNow, schedulingTolerance),
+                          _nextMotionVideoHostTime) < 0) {
+            return;
+        }
+
+        CMTime elapsed = CMTimeSubtract(motionNow, _motionRecordingStartTime);
+        motionPresentationTime = CMTimeConvertScale(
+            elapsed,
+            kMotionRecordingTimeScale,
+            kCMTimeRoundingMethod_RoundHalfAwayFromZero);
+        if (CMTIME_IS_VALID(_lastMotionVideoPresentationTime) &&
+            CMTimeCompare(motionPresentationTime,
+                          _lastMotionVideoPresentationTime) <= 0) {
+            motionPresentationTime = CMTimeAdd(
+                _lastMotionVideoPresentationTime,
+                CMTimeMake(1, kMotionRecordingTimeScale));
+        }
     }
     id <RTCVideoFrameBuffer> buffer = frame.buffer;
     CVPixelBufferRef pixelBufferRef;
@@ -267,23 +326,13 @@
     CMSampleTimingInfo timingInfo;
     
     timingInfo.decodeTimeStamp = kCMTimeInvalid;
-    if ([self.output.path containsString:@".motion_recording.mp4"]) {
-        // 本地 RTCVideoFrame 时间戳在部分 iOS 设备上不是墙钟速率，改用 host
-        // clock，避免实际 20 秒被写成 60 秒以及音视频时长不一致。
-        CMTime now = CMClockGetTime(CMClockGetHostTimeClock());
-        if (!CMTIME_IS_VALID(_motionRecordingStartTime)) {
-            _motionRecordingStartTime = now;
-        }
-        CMTime presentationTime = CMTimeSubtract(now, _motionRecordingStartTime);
-        CMTime frameDuration = CMTimeMake(1, self.writerInput.mediaTimeScale > 0 ? self.writerInput.mediaTimeScale : 18);
-        if (CMTIME_IS_VALID(_lastMotionVideoPresentationTime) &&
-            CMTimeCompare(presentationTime, _lastMotionVideoPresentationTime) <= 0) {
-            presentationTime = CMTimeAdd(_lastMotionVideoPresentationTime, frameDuration);
-        }
-        timingInfo.duration = frameDuration;
-        timingInfo.presentationTimeStamp = presentationTime;
+    if (isMotionRecording) {
+        timingInfo.duration = CMTimeMake(1, kMotionRecordingFrameRate);
+        timingInfo.presentationTimeStamp = motionPresentationTime;
     } else {
-        CMTimeScale timeScale = self.writerInput.mediaTimeScale > 0 ? self.writerInput.mediaTimeScale : 18;
+        CMTimeScale timeScale = self.writerInput.mediaTimeScale > 0
+            ? self.writerInput.mediaTimeScale
+            : kViewerRecordingFrameRate;
         timingInfo.duration = CMTimeMake(1, timeScale);
         timingInfo.presentationTimeStamp = CMTimeMake(framesCount, timeScale);
     }
@@ -301,8 +350,18 @@
     if (status == noErr && outBuffer != NULL) {
         if ([self.writerInput appendSampleBuffer:outBuffer]) {
             framesCount++;
-            if ([self.output.path containsString:@".motion_recording.mp4"]) {
+            if (isMotionRecording) {
                 _lastMotionVideoPresentationTime = timingInfo.presentationTimeStamp;
+                CMTime frameInterval = CMTimeMake(1, kMotionRecordingFrameRate);
+                CMTime nextScheduledTime = CMTimeAdd(
+                    _nextMotionVideoHostTime,
+                    frameInterval);
+                // App/编码线程若长时间挂起，从当前时间重新排期，避免恢复后突发补帧。
+                if (CMTimeCompare(motionNow,
+                                  CMTimeAdd(nextScheduledTime, frameInterval)) > 0) {
+                    nextScheduledTime = CMTimeAdd(motionNow, frameInterval);
+                }
+                _nextMotionVideoHostTime = nextScheduledTime;
             }
         } else {
             NSLog(@"Frame not appended %@", self.assetWriter.error);
@@ -338,6 +397,11 @@
           _audioFrameCount,
           _audioAppendCount,
           _audioDropCount);
+    if (CMTIME_IS_VALID(_lastMotionVideoPresentationTime)) {
+        NSLog(@"[SUR-REC][ios] stop motionVideoFrames=%d duration=%.3f",
+              framesCount,
+              CMTimeGetSeconds(_lastMotionVideoPresentationTime));
+    }
     [self.videoTrack removeRenderer:self];
     [self.writerInput markAsFinished];
     [_audioWriter markAsFinished];
