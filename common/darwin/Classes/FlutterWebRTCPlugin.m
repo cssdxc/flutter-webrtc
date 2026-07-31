@@ -1691,10 +1691,28 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
             NSString* path = argsMap[@"path"];
             NSString* trackId = argsMap[@"videoTrackId"];
             NSString* peerConnectionId = argsMap[@"peerConnectionId"];
-            NSString* audioTrackId = [self audioTrackIdForVideoTrackId:trackId];
+            NSNumber* audioChannel = argsMap[@"audioChannel"];
+            id rawAudioTrackId = argsMap[@"audioTrackId"];
+            NSString* explicitAudioTrackId = [rawAudioTrackId isKindOfClass:[NSString class]] ? rawAudioTrackId : nil;
+            NSString* audioTrackId = explicitAudioTrackId ?: [self audioTrackIdForVideoTrackId:trackId];
 
             RTCMediaStreamTrack *track = [self trackForId:trackId peerConnectionId:peerConnectionId];
             RTCMediaStreamTrack *audioTrack = [self trackForId:audioTrackId peerConnectionId:peerConnectionId];
+            NSLog(@"[SUR-REC][ios] start path=%@ videoTrackId=%@ peerConnectionId=%@ audioTrackId=%@ videoTrack=%@ audioTrack=%@", path, trackId, peerConnectionId, audioTrackId, track, audioTrack);
+            if (audioTrack == nil && audioChannel != nil && [audioChannel integerValue] == 0) {
+                for (NSString *localTrackId in self.localTracks) {
+                    id<LocalTrack> localTrack = self.localTracks[localTrackId];
+                    if (localTrack != nil && [localTrack isKindOfClass:[LocalAudioTrack class]]) {
+                        audioTrack = [localTrack track];
+                        audioTrackId = localTrackId;
+                        NSLog(@"[SUR-REC][ios] local INPUT audioTrackId=%@ audioTrack=%@", audioTrackId, audioTrack);
+                        break;
+                    }
+                }
+            }
+            if (audioTrack != nil && explicitAudioTrackId != nil) {
+                NSLog(@"[SUR-REC][ios] explicit INPUT audioTrackId=%@ audioTrack=%@", audioTrackId, audioTrack);
+            }
             if (track != nil && [track isKindOfClass:[RTCVideoTrack class]]) {
                 NSURL* pathUrl = [NSURL fileURLWithPath:path];
                 self.recorders[recorderId] = [[FlutterRTCMediaRecorder alloc]

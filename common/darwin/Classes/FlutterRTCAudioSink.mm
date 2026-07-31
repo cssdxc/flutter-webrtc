@@ -1,66 +1,170 @@
 #import <AVFoundation/AVFoundation.h>
 #import "FlutterRTCAudioSink.h"
-#import "RTCAudioSource+Private.h"
-#include "media_stream_interface.h"
-#include "audio_sink_bridge.cpp"
+#import "AudioManager.h"
+#import <WebRTC/RTCAudioRenderer.h>
+
+@interface FlutterRTCAudioSink ()
+- (CMSampleTimingInfo)nextAudioTimingWithSampleRate:(int)sampleRate
+                                    numberOfFrames:(size_t)numberOfFrames;
+- (void)updateFormatIfNeeded:(CMAudioFormatDescriptionRef)format;
+@end
 
 @implementation FlutterRTCAudioSink {
-    AudioSinkBridge *_bridge;
-    webrtc::AudioSourceInterface* _audioSource;
+    RTCAudioTrack *_audioTrack;
+    int64_t _audioSamplePosition;
+    BOOL _closed;
+    BOOL _usesLocalCapture;
+    BOOL _loggedFormat;
+    int _dataBufferErrorCount;
 }
 
 - (instancetype) initWithAudioTrack:(RTCAudioTrack* )audio {
+    return [self initWithAudioTrack:audio useLocalCapture:NO];
+}
+
+- (instancetype) initWithAudioTrack:(RTCAudioTrack* )audio
+                   useLocalCapture:(BOOL)useLocalCapture {
     self = [super init];
-    rtc::scoped_refptr<webrtc::AudioSourceInterface> audioSourcePtr = audio.source.nativeAudioSource;
-    _audioSource = audioSourcePtr.get();
-    _bridge = new AudioSinkBridge((void*)CFBridgingRetain(self));
-    _audioSource->AddSink(_bridge);
+    _audioSamplePosition = 0;
+    _closed = NO;
+    _usesLocalCapture = useLocalCapture;
+    _loggedFormat = NO;
+    _dataBufferErrorCount = 0;
+    _audioTrack = audio;
+    if (_usesLocalCapture) {
+        [AudioManager.sharedInstance addLocalAudioRenderer:self];
+        NSLog(@"[SUR-REC][ios] local capture renderer attached track=%@", _audioTrack);
+    } else {
+        [_audioTrack addRenderer:self];
+        NSLog(@"[SUR-REC][ios] remote track renderer attached track=%@", _audioTrack);
+    }
     return self;
 }
 
 - (void) close {
-    _audioSource->RemoveSink(_bridge);
-    delete _bridge;
-    _bridge = nil;
-    _audioSource = nil;
+    if (_closed) {
+        return;
+    }
+    _closed = YES;
+    if (_audioTrack != nil) {
+        if (_usesLocalCapture) {
+            [AudioManager.sharedInstance removeLocalAudioRenderer:self];
+            NSLog(@"[SUR-REC][ios] local capture renderer detached track=%@", _audioTrack);
+        } else {
+            [_audioTrack removeRenderer:self];
+            NSLog(@"[SUR-REC][ios] remote track renderer detached track=%@", _audioTrack);
+        }
+        _audioTrack = nil;
+    }
 }
 
-void RTCAudioSinkCallback (void *object, const void *audio_data, int bits_per_sample, int sample_rate, size_t number_of_channels, size_t number_of_frames)
-{
-    AudioBufferList audioBufferList;
-    AudioBuffer audioBuffer;
-    audioBuffer.mData = (void*) audio_data;
-    audioBuffer.mDataByteSize = bits_per_sample / 8 * number_of_channels * number_of_frames;
-    audioBuffer.mNumberChannels = number_of_channels;
-    audioBufferList.mNumberBuffers = 1;
-    audioBufferList.mBuffers[0] = audioBuffer;
-    AudioStreamBasicDescription audioDescription;
-    audioDescription.mBytesPerFrame = bits_per_sample / 8 * number_of_channels;
-    audioDescription.mBitsPerChannel = bits_per_sample;
-    audioDescription.mBytesPerPacket = bits_per_sample / 8 * number_of_channels;
-    audioDescription.mChannelsPerFrame = number_of_channels;
-    audioDescription.mFormatID = kAudioFormatLinearPCM;
-    audioDescription.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagsNativeEndian | kAudioFormatFlagIsPacked;
-    audioDescription.mFramesPerPacket = 1;
-    audioDescription.mReserved = 0;
-    audioDescription.mSampleRate = sample_rate;
-    CMAudioFormatDescriptionRef formatDesc;
-    CMAudioFormatDescriptionCreate(kCFAllocatorDefault, &audioDescription, 0, nil, 0, nil, nil, &formatDesc);
-    CMSampleBufferRef buffer;
+- (CMSampleTimingInfo)nextAudioTimingWithSampleRate:(int)sampleRate
+                                    numberOfFrames:(size_t)numberOfFrames {
     CMSampleTimingInfo timing;
     timing.decodeTimeStamp = kCMTimeInvalid;
-    timing.presentationTimeStamp = CMTimeMake(0, sample_rate);
-    timing.duration = CMTimeMake(1, sample_rate);
-    CMSampleBufferCreate(kCFAllocatorDefault, nil, false, nil, nil, formatDesc, number_of_frames * number_of_channels, 1, &timing, 0, nil, &buffer);
-    CMSampleBufferSetDataBufferFromAudioBufferList(buffer, kCFAllocatorDefault, kCFAllocatorDefault, 0, &audioBufferList);
-    @autoreleasepool {
-        FlutterRTCAudioSink* sink = (__bridge FlutterRTCAudioSink*)(object);
-        sink.format = formatDesc;
-        if (sink.bufferCallback != nil) {
-            sink.bufferCallback(buffer);
-        } else {
-            NSLog(@"Buffer callback is nil");
+    timing.presentationTimeStamp = CMTimeMake(_audioSamplePosition, sampleRate);
+    timing.duration = CMTimeMake((int64_t)numberOfFrames, sampleRate);
+    _audioSamplePosition += (int64_t)numberOfFrames;
+    return timing;
+}
+
+- (void)updateFormatIfNeeded:(CMAudioFormatDescriptionRef)format {
+    if (self.format == nil && format != NULL) {
+        self.format = (CMAudioFormatDescriptionRef)CFRetain(format);
+    }
+}
+
+- (void)dealloc {
+    [self close];
+    if (self.format != nil) {
+        CFRelease(self.format);
+        self.format = nil;
+    }
+}
+
+- (void)renderPCMBuffer:(AVAudioPCMBuffer *)pcmBuffer
+{
+    if (_closed || pcmBuffer == nil || pcmBuffer.frameLength == 0) {
+        return;
+    }
+
+    const AudioStreamBasicDescription *sourceDescription = pcmBuffer.format.streamDescription;
+    if (sourceDescription == NULL || sourceDescription->mSampleRate <= 0) {
+        return;
+    }
+
+    AVAudioFrameCount frameLength = pcmBuffer.frameLength;
+
+    if (!_loggedFormat) {
+        NSLog(@"[SUR-REC][ios] audio pcm sampleRate=%.0f channels=%u frames=%u sourceFlags=%u sourceBits=%u",
+              sourceDescription->mSampleRate,
+              (unsigned int)sourceDescription->mChannelsPerFrame,
+              (unsigned int)frameLength,
+              (unsigned int)sourceDescription->mFormatFlags,
+              (unsigned int)sourceDescription->mBitsPerChannel);
+        _loggedFormat = YES;
+    }
+
+    CMAudioFormatDescriptionRef formatDesc = NULL;
+    OSStatus formatStatus = CMAudioFormatDescriptionCreate(kCFAllocatorDefault,
+                                                            sourceDescription,
+                                                            0,
+                                                            nil,
+                                                            0,
+                                                            nil,
+                                                            nil,
+                                                            &formatDesc);
+    if (formatStatus != noErr || formatDesc == NULL) {
+        NSLog(@"[SUR-REC][ios] audio format create failed status=%d", (int)formatStatus);
+        return;
+    }
+
+    [self updateFormatIfNeeded:formatDesc];
+
+    CMSampleBufferRef buffer = NULL;
+    CMSampleTimingInfo timing = [self nextAudioTimingWithSampleRate:(int)sourceDescription->mSampleRate
+                                                     numberOfFrames:frameLength];
+    OSStatus bufferStatus = CMSampleBufferCreate(kCFAllocatorDefault,
+                                                  NULL,
+                                                  false,
+                                                  NULL,
+                                                  NULL,
+                                                  formatDesc,
+                                                  frameLength,
+                                                  1,
+                                                  &timing,
+                                                  0,
+                                                  NULL,
+                                                  &buffer);
+    OSStatus dataStatus = bufferStatus;
+    if (dataStatus == noErr && buffer != NULL) {
+        dataStatus = CMSampleBufferSetDataBufferFromAudioBufferList(
+            buffer,
+            kCFAllocatorDefault,
+            kCFAllocatorDefault,
+            kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
+            pcmBuffer.audioBufferList);
+    }
+    if (dataStatus == noErr && buffer != NULL) {
+        dataStatus = CMSampleBufferSetDataReady(buffer);
+    }
+    if (dataStatus == noErr && buffer != NULL && self.bufferCallback != nil) {
+        self.bufferCallback(buffer);
+    } else {
+        _dataBufferErrorCount++;
+        if (_dataBufferErrorCount <= 3 || _dataBufferErrorCount % 100 == 0) {
+            NSLog(@"[SUR-REC][ios] audio sample buffer create failed #%d createStatus=%d dataStatus=%d",
+                  _dataBufferErrorCount,
+                  (int)bufferStatus,
+                  (int)dataStatus);
         }
+    }
+
+    if (buffer != NULL) {
+        CFRelease(buffer);
+    }
+    if (formatDesc != NULL) {
+        CFRelease(formatDesc);
     }
 }
 

@@ -60,7 +60,7 @@
 
 - (AVAudioPCMBuffer*)toPCMBuffer:(RTC_OBJC_TYPE(RTCAudioBuffer) *)audioBuffer {
   AVAudioFormat* format =
-      [[AVAudioFormat alloc] initWithCommonFormat:AVAudioPCMFormatInt16
+      [[AVAudioFormat alloc] initWithCommonFormat:AVAudioPCMFormatFloat32
                                        sampleRate:audioBuffer.frames * 100.0
                                          channels:(AVAudioChannelCount)audioBuffer.channels
                                       interleaved:NO];
@@ -74,7 +74,7 @@
   pcmBuffer.frameLength = (AVAudioFrameCount)audioBuffer.frames;
   for (int i = 0; i < audioBuffer.channels; i++) {
     float* sourceBuffer = [audioBuffer rawBufferForChannel:i];
-    int16_t* targetBuffer = (int16_t*)pcmBuffer.int16ChannelData[i];
+    float* targetBuffer = pcmBuffer.floatChannelData[i];
     for (int frame = 0; frame < audioBuffer.frames; frame++) {
       targetBuffer[frame] = sourceBuffer[frame];
     }
