@@ -16,11 +16,13 @@ class RTCVideoPlatFormView extends StatefulWidget {
     this.objectFit = RTCVideoViewObjectFit.RTCVideoViewObjectFitContain,
     this.mirror = false,
     this.placeholderBuilder,
+    this.keepViewMounted = false,
   });
   final void Function(RTCVideoPlatformViewController)? onViewReady;
   final RTCVideoViewObjectFit objectFit;
   final bool mirror;
   final WidgetBuilder? placeholderBuilder;
+  final bool keepViewMounted;
   @override
   NativeVideoPlayerViewState createState() => NativeVideoPlayerViewState();
 }
@@ -42,18 +44,20 @@ class NativeVideoPlayerViewState extends State<RTCVideoPlatFormView> {
   @override
   Widget build(BuildContext context) {
     return LayoutBuilder(
-        builder: (BuildContext context, BoxConstraints constraints) =>
-            _buildVideoView(context, constraints));
+      builder: (BuildContext context, BoxConstraints constraints) =>
+          _buildVideoView(context, constraints),
+    );
   }
 
   Widget _buildVideoView(BuildContext context, BoxConstraints constraints) {
+    final showNativeView = widget.keepViewMounted || _showVideoView;
     final nativeView = SizedBox(
-      width: _showVideoView
+      width: showNativeView
           ? widget.objectFit == RTCVideoViewObjectFit.RTCVideoViewObjectFitCover
               ? constraints.maxWidth
               : constraints.maxHeight * (_controller?.value.aspectRatio ?? 1.0)
           : 0.1,
-      height: _showVideoView ? constraints.maxHeight : 0.1,
+      height: showNativeView ? constraints.maxHeight : 0.1,
       child: Transform(
         transform: Matrix4.identity()..rotateY(widget.mirror ? -pi : 0.0),
         alignment: FractionalOffset.center,
@@ -61,30 +65,50 @@ class NativeVideoPlayerViewState extends State<RTCVideoPlatFormView> {
       ),
     );
 
-    if (!_showVideoView && widget.placeholderBuilder != null) {
-      return Center(
-        child: SizedBox(
-          width: constraints.maxWidth,
-          height: constraints.maxHeight,
-          child: Stack(
-            children: [
-              Positioned.fill(child: nativeView),
-              Positioned.fill(child: widget.placeholderBuilder!(context)),
-            ],
+    if (!widget.keepViewMounted) {
+      if (!_showVideoView && widget.placeholderBuilder != null) {
+        return Center(
+          child: SizedBox(
+            width: constraints.maxWidth,
+            height: constraints.maxHeight,
+            child: Stack(
+              children: [
+                Positioned.fill(child: nativeView),
+                Positioned.fill(child: widget.placeholderBuilder!(context)),
+              ],
+            ),
           ),
+        );
+      }
+
+      return Center(
+        child: FittedBox(
+          clipBehavior: Clip.hardEdge,
+          fit: widget.objectFit ==
+                  RTCVideoViewObjectFit.RTCVideoViewObjectFitContain
+              ? BoxFit.contain
+              : BoxFit.cover,
+          child: Center(child: nativeView),
         ),
       );
     }
 
-    return Center(
-      child: FittedBox(
-        clipBehavior: Clip.hardEdge,
-        fit: widget.objectFit ==
-                RTCVideoViewObjectFit.RTCVideoViewObjectFitContain
-            ? BoxFit.contain
-            : BoxFit.cover,
-        child: Center(child: nativeView),
-      ),
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        Center(
+          child: FittedBox(
+            clipBehavior: Clip.hardEdge,
+            fit: widget.objectFit ==
+                    RTCVideoViewObjectFit.RTCVideoViewObjectFitContain
+                ? BoxFit.contain
+                : BoxFit.cover,
+            child: Center(child: nativeView),
+          ),
+        ),
+        if (!_showVideoView && widget.placeholderBuilder != null)
+          Positioned.fill(child: widget.placeholderBuilder!(context)),
+      ],
     );
   }
 

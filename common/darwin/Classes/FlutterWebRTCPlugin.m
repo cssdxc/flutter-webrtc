@@ -11,6 +11,7 @@
 #import "FlutterRTCFrameCryptor.h"
 #if TARGET_OS_IPHONE
 #import "FlutterRTCMediaRecorder.h"
+#import "FlutterRTCPictureInPictureController.h"
 #endif
 #if TARGET_OS_IPHONE || TARGET_OS_OSX
 #import "FlutterRTCVideoPlatformViewFactory.h"
@@ -19,6 +20,9 @@
 #import "AudioManager.h"
 
 #import <AVFoundation/AVFoundation.h>
+#if TARGET_OS_IPHONE
+#import <AVKit/AVKit.h>
+#endif
 #import <WebRTC/RTCFieldTrials.h>
 #import <WebRTC/WebRTC.h>
 
@@ -33,6 +37,12 @@
 #import "LocalAudioTrack.h"
 #import "LocalVideoTrack.h"
 
+#if DEBUG
+#define FLUTTER_RTC_PIP_LOG(...) NSLog(__VA_ARGS__)
+#else
+#define FLUTTER_RTC_PIP_LOG(...) do { } while (0)
+#endif
+
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wprotocol"
 
@@ -44,6 +54,7 @@
 
 @interface VideoEncoderFactorySimulcast : RTCVideoEncoderFactorySimulcast
 @end
+
 
 NSArray<RTC_OBJC_TYPE(RTCVideoCodecInfo) *>* motifyH264ProfileLevelId(
     NSArray<RTC_OBJC_TYPE(RTCVideoCodecInfo) *>* codecs) {
@@ -107,6 +118,13 @@ void postEvent(FlutterEventSink _Nullable sink, id _Nullable event) {
     });
 }
 
+#if TARGET_OS_IPHONE
+@interface FlutterWebRTCPlugin ()
+- (FlutterRTCPictureInPictureController*)pictureInPictureControllerCreatingIfNeeded
+    API_AVAILABLE(ios(15.0));
+@end
+#endif
+
 @implementation FlutterWebRTCPlugin {
 #pragma clang diagnostic pop
   FlutterMethodChannel* _methodChannel;
@@ -119,6 +137,10 @@ void postEvent(FlutterEventSink _Nullable sink, id _Nullable event) {
   BOOL _speakerOnButPreferBluetooth;
   AVAudioSessionPort _preferredInput;
   AudioManager* _audioManager;
+#if TARGET_OS_IPHONE
+  id _pictureInPictureController;
+  FlutterMethodChannel* _pictureInPictureChannel;
+#endif
 #if TARGET_OS_IPHONE || TARGET_OS_OSX
   FlutterRTCVideoPlatformViewFactory *_platformViewFactory;
 #endif
@@ -234,6 +256,9 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
 #if TARGET_OS_IPHONE
     _preferredInput = AVAudioSessionPortHeadphones;
     self.viewController = viewController;
+    _pictureInPictureChannel =
+        [FlutterMethodChannel methodChannelWithName:@"FlutterWebRTC.PictureInPicture"
+                                    binaryMessenger:messenger];
 #endif
 #if TARGET_OS_IPHONE || TARGET_OS_OSX
     _platformViewFactory  = [[FlutterRTCVideoPlatformViewFactory alloc] initWithMessenger:messenger];
@@ -918,6 +943,205 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
       [dataChannels removeAllObjects];
     }
     [self deactiveRtcAudioSession];
+    result(nil);
+  } else if ([@"pipIsSupported" isEqualToString:call.method]) {
+#if TARGET_OS_IPHONE
+    if (@available(iOS 15.0, *)) {
+      BOOL supported = AVPictureInPictureController.isPictureInPictureSupported;
+      FLUTTER_RTC_PIP_LOG(@"FlutterWebRTC PiP pipIsSupported=%d", supported);
+      result(@(supported));
+    } else {
+      FLUTTER_RTC_PIP_LOG(@"FlutterWebRTC PiP pipIsSupported=0: iOS < 15");
+      result(@NO);
+    }
+#else
+    result(@NO);
+#endif
+  } else if ([@"pipIsActive" isEqualToString:call.method]) {
+#if TARGET_OS_IPHONE
+    if (@available(iOS 15.0, *)) {
+      FlutterRTCPictureInPictureController* pipController =
+          (FlutterRTCPictureInPictureController*)_pictureInPictureController;
+      result(@([pipController isActive]));
+    } else {
+      result(@NO);
+    }
+#else
+    result(@NO);
+#endif
+  } else if ([@"pipDebugState" isEqualToString:call.method]) {
+#if TARGET_OS_IPHONE
+    if (@available(iOS 15.0, *)) {
+      FlutterRTCPictureInPictureController* pipController =
+          (FlutterRTCPictureInPictureController*)_pictureInPictureController;
+      result(pipController == nil ? @{
+        @"event" : @"controllerNotCreated",
+        @"appState" : @"unknown",
+      } : [pipController debugState]);
+    } else {
+      result(@{@"event" : @"requiresIOS15"});
+    }
+#else
+    result(@{@"event" : @"notIOS"});
+#endif
+  } else if ([@"pipPrepare" isEqualToString:call.method]) {
+#if TARGET_OS_IPHONE
+    if (@available(iOS 15.0, *)) {
+      NSDictionary* argsMap = call.arguments;
+      NSString* trackId = argsMap[@"trackId"];
+      NSString* peerConnectionId = argsMap[@"peerConnectionId"];
+      NSNumber* sourceViewId = argsMap[@"sourceViewId"];
+      FLUTTER_RTC_PIP_LOG(@"FlutterWebRTC PiP pipPrepare: trackId=%@ peerConnectionId=%@ sourceViewId=%@",
+            trackId,
+            peerConnectionId,
+            sourceViewId);
+      RTCMediaStreamTrack* track = [self trackForId:trackId peerConnectionId:peerConnectionId];
+      FlutterRTCVideoPlatformViewController* sourceRenderer =
+          sourceViewId == nil ? nil : _platformViewFactory.renders[sourceViewId];
+      UIView* sourceView = (UIView*)[sourceRenderer view];
+      if (![track isKindOfClass:[RTCVideoTrack class]] || sourceView == nil) {
+        FLUTTER_RTC_PIP_LOG(@"FlutterWebRTC PiP pipPrepare failed: track=%@ sourceView=%@", track, sourceView);
+        result([FlutterError errorWithCode:@"pipPrepare"
+                                   message:@"Video track or source view is unavailable"
+                                   details:nil]);
+        return;
+      }
+
+      FlutterRTCPictureInPictureController* pipController =
+          [self pictureInPictureControllerCreatingIfNeeded];
+      NSError* prepareError =
+          [pipController prepareWithVideoTrack:(RTCVideoTrack*)track sourceView:sourceView];
+      if (prepareError != nil) {
+        result([FlutterError errorWithCode:@"pipPrepare"
+                                   message:prepareError.localizedDescription
+                                   details:nil]);
+      } else {
+        result(nil);
+      }
+    } else {
+      result([FlutterError errorWithCode:@"pipPrepare"
+                                 message:@"Picture in Picture requires iOS 15 or later"
+                                 details:nil]);
+    }
+#else
+    result([FlutterError errorWithCode:@"pipPrepare"
+                               message:@"Picture in Picture is only supported on iOS"
+                               details:nil]);
+#endif
+  } else if ([@"pipStart" isEqualToString:call.method]) {
+#if TARGET_OS_IPHONE
+    if (@available(iOS 15.0, *)) {
+      NSDictionary* argsMap = call.arguments;
+      NSString* trackId = argsMap[@"trackId"];
+      NSString* peerConnectionId = argsMap[@"peerConnectionId"];
+      NSNumber* sourceViewId = argsMap[@"sourceViewId"];
+      FLUTTER_RTC_PIP_LOG(@"FlutterWebRTC PiP pipStart: trackId=%@ peerConnectionId=%@ sourceViewId=%@",
+            trackId,
+            peerConnectionId,
+            sourceViewId);
+      if (trackId.length == 0) {
+        FLUTTER_RTC_PIP_LOG(@"FlutterWebRTC PiP pipStart failed: missing track id");
+        result([FlutterError errorWithCode:@"pipStart"
+                                   message:@"Missing video track id"
+                                   details:nil]);
+        return;
+      }
+
+      RTCMediaStreamTrack* track = [self trackForId:trackId peerConnectionId:peerConnectionId];
+      if (![track isKindOfClass:[RTCVideoTrack class]]) {
+        FLUTTER_RTC_PIP_LOG(@"FlutterWebRTC PiP pipStart failed: video track not found");
+        result([FlutterError errorWithCode:@"pipStart"
+                                   message:@"Remote video track was not found"
+                                   details:nil]);
+        return;
+      }
+      FlutterRTCVideoPlatformViewController* sourceRenderer =
+          sourceViewId == nil ? nil : _platformViewFactory.renders[sourceViewId];
+      UIView* sourceView = (UIView*)[sourceRenderer view];
+      if (sourceView == nil) {
+        sourceView = [self pictureInPictureSourceView];
+      }
+      if (sourceView == nil) {
+        FLUTTER_RTC_PIP_LOG(@"FlutterWebRTC PiP pipStart failed: source view unavailable");
+        result([FlutterError errorWithCode:@"pipStart"
+                                   message:@"Source view is unavailable"
+                                   details:nil]);
+        return;
+      }
+
+      FlutterRTCPictureInPictureController* pipController =
+          [self pictureInPictureControllerCreatingIfNeeded];
+
+      [pipController startWithVideoTrack:(RTCVideoTrack*)track
+                              sourceView:sourceView
+                              completion:^(NSError* error) {
+        if (error != nil) {
+          result([FlutterError errorWithCode:@"pipStart"
+                                     message:error.localizedDescription
+                                     details:nil]);
+        } else {
+          result(nil);
+        }
+      }];
+    } else {
+      result([FlutterError errorWithCode:@"pipStart"
+                                 message:@"Picture in Picture requires iOS 15 or later"
+                                 details:nil]);
+    }
+#else
+    result([FlutterError errorWithCode:@"pipStart"
+                               message:@"Picture in Picture is only supported on iOS"
+                               details:nil]);
+#endif
+  } else if ([@"pipUpdateTrack" isEqualToString:call.method]) {
+#if TARGET_OS_IPHONE
+    if (@available(iOS 15.0, *)) {
+      NSDictionary* argsMap = call.arguments;
+      NSString* trackId = argsMap[@"trackId"];
+      NSString* peerConnectionId = argsMap[@"peerConnectionId"];
+      RTCMediaStreamTrack* track = [self trackForId:trackId peerConnectionId:peerConnectionId];
+      FlutterRTCPictureInPictureController* pipController =
+          (FlutterRTCPictureInPictureController*)_pictureInPictureController;
+      if (![track isKindOfClass:[RTCVideoTrack class]] || pipController == nil) {
+        result([FlutterError errorWithCode:@"pipUpdateTrack"
+                                   message:@"Video track or PiP controller is unavailable"
+                                   details:nil]);
+        return;
+      }
+      [pipController updateVideoTrack:(RTCVideoTrack*)track];
+    }
+#endif
+    result(nil);
+  } else if ([@"pipStop" isEqualToString:call.method]) {
+#if TARGET_OS_IPHONE
+    if (@available(iOS 15.0, *)) {
+      FlutterRTCPictureInPictureController* pipController =
+          (FlutterRTCPictureInPictureController*)_pictureInPictureController;
+      [pipController stop];
+    }
+#endif
+    result(nil);
+  } else if ([@"pipDispose" isEqualToString:call.method]) {
+#if TARGET_OS_IPHONE
+    if (@available(iOS 15.0, *)) {
+      FlutterRTCPictureInPictureController* pipController =
+          (FlutterRTCPictureInPictureController*)_pictureInPictureController;
+      if (pipController == nil) {
+        result(nil);
+        return;
+      }
+      __weak typeof(self) weakSelf = self;
+      [pipController disposeWithCompletion:^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (strongSelf != nil &&
+            strongSelf->_pictureInPictureController == pipController) {
+          strongSelf->_pictureInPictureController = nil;
+        }
+        result(nil);
+      }];
+      return;
+    }
+#endif
     result(nil);
   } else if ([@"createVideoRenderer" isEqualToString:call.method]) {
     FlutterRTCVideoRenderer* render = [self createWithTextureRegistry:_textures
@@ -1853,6 +2077,15 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
 }
 
 - (void)dealloc {
+#if TARGET_OS_IPHONE
+  if (@available(iOS 15.0, *)) {
+    FlutterRTCPictureInPictureController* pipController =
+        (FlutterRTCPictureInPictureController*)_pictureInPictureController;
+    [pipController disposeImmediately];
+    _pictureInPictureController = nil;
+  }
+#endif
+
   [_localTracks removeAllObjects];
   _localTracks = nil;
   [_localStreams removeAllObjects];
@@ -1866,6 +2099,80 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
   [_peerConnections removeAllObjects];
   _peerConnectionFactory = nil;
 }
+
+#if TARGET_OS_IPHONE
+- (FlutterRTCPictureInPictureController*)pictureInPictureControllerCreatingIfNeeded {
+  FlutterRTCPictureInPictureController* pipController =
+      (FlutterRTCPictureInPictureController*)_pictureInPictureController;
+  if (pipController != nil) {
+    return pipController;
+  }
+
+  pipController = [[FlutterRTCPictureInPictureController alloc] init];
+  __weak typeof(self) weakSelf = self;
+  pipController.restoreUserInterfaceHandler = ^(
+      FlutterRTCPictureInPictureRestoreCompletion completion) {
+    __strong typeof(weakSelf) strongSelf = weakSelf;
+    if (strongSelf == nil) {
+      completion(NO);
+      return;
+    }
+
+    FLUTTER_RTC_PIP_LOG(@"FlutterWebRTC PiP forwarding restore request to Dart");
+    [strongSelf->_pictureInPictureChannel
+        invokeMethod:@"restoreUserInterface"
+           arguments:nil
+              result:^(id result) {
+                BOOL restored = [result isKindOfClass:[NSNumber class]]
+                    ? [result boolValue]
+                    : NO;
+                FLUTTER_RTC_PIP_LOG(@"FlutterWebRTC PiP Dart restore result=%d", restored);
+                completion(restored);
+              }];
+  };
+  pipController.stateChangedHandler = ^(BOOL active) {
+    __strong typeof(weakSelf) strongSelf = weakSelf;
+    if (strongSelf == nil) {
+      return;
+    }
+    [strongSelf->_pictureInPictureChannel
+        invokeMethod:@"stateChanged"
+           arguments:@{ @"active" : @(active) }];
+  };
+  _pictureInPictureController = pipController;
+  return pipController;
+}
+
+- (UIView* _Nullable)pictureInPictureSourceView {
+  if ([self.viewController isKindOfClass:[UIViewController class]]) {
+    UIViewController* viewController = (UIViewController*)self.viewController;
+    if (viewController.view != nil) {
+      return viewController.view;
+    }
+  }
+
+  if (@available(iOS 13.0, *)) {
+    for (UIScene* scene in UIApplication.sharedApplication.connectedScenes) {
+      if (![scene isKindOfClass:[UIWindowScene class]]) {
+        continue;
+      }
+      UIWindowScene* windowScene = (UIWindowScene*)scene;
+      if (windowScene.activationState != UISceneActivationStateForegroundActive &&
+          windowScene.activationState != UISceneActivationStateForegroundInactive) {
+        continue;
+      }
+      for (UIWindow* window in windowScene.windows) {
+        if (window.isKeyWindow && window.rootViewController.view != nil) {
+          return window.rootViewController.view;
+        }
+      }
+    }
+  }
+
+  UIWindow* keyWindow = UIApplication.sharedApplication.keyWindow;
+  return keyWindow.rootViewController.view;
+}
+#endif
 
 - (BOOL)hasLocalAudioTrack {
   for (id key in _localTracks.allKeys) {
