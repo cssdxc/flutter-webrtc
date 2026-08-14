@@ -140,6 +140,8 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
 
   private Activity activity;
 
+  private final FlutterRTCPictureInPictureController pictureInPictureController;
+
   private CustomVideoEncoderFactory videoEncoderFactory;
 
   private CustomVideoDecoderFactory videoDecoderFactory;
@@ -161,10 +163,12 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
 
   public static LogSink logSink = new LogSink();
 
-  MethodCallHandlerImpl(Context context, BinaryMessenger messenger, TextureRegistry textureRegistry) {
+  MethodCallHandlerImpl(Context context, BinaryMessenger messenger, TextureRegistry textureRegistry,
+                        FlutterRTCPictureInPictureController pictureInPictureController) {
     this.context = context;
     this.textures = textureRegistry;
     this.messenger = messenger;
+    this.pictureInPictureController = pictureInPictureController;
   }
 
   static private void resultError(String method, String error, Result result) {
@@ -208,6 +212,7 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
       }
     }
     mPeerConnectionObservers.clear();
+    pictureInPictureController.disposeController();
   }
   private void initialize(boolean bypassVoiceProcessing, boolean androidUseHardwareAudioProcessing, int networkIgnoreMask, boolean forceSWCodec, List<String> forceSWCodecList,
   @Nullable ConstraintsMap androidAudioConfiguration, Severity logSeverity, @Nullable Integer audioSampleRate, @Nullable Integer audioOutputSampleRate) {
@@ -371,6 +376,30 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
 
     final AnyThreadResult result = new AnyThreadResult(notSafeResult);
     switch (call.method) {
+      case "pipIsSupported": {
+        pictureInPictureController.isSupported(result);
+        break;
+      }
+      case "pipIsActive": {
+        pictureInPictureController.isActive(result);
+        break;
+      }
+      case "pipStart": {
+        pictureInPictureController.start(call, result);
+        break;
+      }
+      case "pipStop": {
+        pictureInPictureController.stop(result);
+        break;
+      }
+      case "pipDispose": {
+        pictureInPictureController.dispose(result);
+        break;
+      }
+      case "pipDebugState": {
+        pictureInPictureController.debugState(result);
+        break;
+      }
       case "initialize": {
         int networkIgnoreMask = Options.ADAPTER_TYPE_UNKNOWN;
         Map<String, Object> options = call.argument("options");
@@ -2322,6 +2351,7 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
 
   public void setActivity(Activity activity) {
     this.activity = activity;
+    pictureInPictureController.setActivity(activity);
   }
 
   public void addTrack(String peerConnectionId, String trackId, List<String> streamIds, Result result) {

@@ -33,7 +33,11 @@ class WebRTCPictureInPicture {
   }
 
   static void _ensureEventChannelInitialized() {
-    if (kIsWeb || !Platform.isIOS || _isEventChannelInitialized) return;
+    if (kIsWeb ||
+        (!Platform.isIOS && !Platform.isAndroid) ||
+        _isEventChannelInitialized) {
+      return;
+    }
     _isEventChannelInitialized = true;
     _eventChannel.setMethodCallHandler(_handleEventChannelCall);
   }
@@ -55,8 +59,8 @@ class WebRTCPictureInPicture {
   }
 
   static Future<bool> isSupported() async {
-    if (kIsWeb || !Platform.isIOS) {
-      debugPrint('FlutterWebRTC PiP isSupported=false: not iOS');
+    if (kIsWeb || (!Platform.isIOS && !Platform.isAndroid)) {
+      debugPrint('FlutterWebRTC PiP isSupported=false: unsupported platform');
       return false;
     }
     final supported =
@@ -66,7 +70,7 @@ class WebRTCPictureInPicture {
   }
 
   static Future<bool> isActive() async {
-    if (kIsWeb || !Platform.isIOS) {
+    if (kIsWeb || (!Platform.isIOS && !Platform.isAndroid)) {
       return false;
     }
     return await WebRTC.invokeMethod<bool, dynamic>('pipIsActive') ?? false;
@@ -93,10 +97,13 @@ class WebRTCPictureInPicture {
   }
 
   static Future<void> start(MediaStreamTrack track, {int? sourceViewId}) async {
-    if (kIsWeb || !Platform.isIOS || track.kind != 'video') {
+    if (kIsWeb ||
+        (!Platform.isIOS && !Platform.isAndroid) ||
+        track.kind != 'video') {
       debugPrint(
         'FlutterWebRTC PiP start ignored: '
-        'isWeb=$kIsWeb, isIOS=${!kIsWeb && Platform.isIOS}, kind=${track.kind}',
+        'isWeb=$kIsWeb, isIOS=${!kIsWeb && Platform.isIOS}, '
+        'isAndroid=${!kIsWeb && Platform.isAndroid}, kind=${track.kind}',
       );
       return;
     }
@@ -126,8 +133,8 @@ class WebRTCPictureInPicture {
   }
 
   static Future<Map<dynamic, dynamic>> debugState() async {
-    if (kIsWeb || !Platform.isIOS) {
-      return <dynamic, dynamic>{'event': 'notIOS'};
+    if (kIsWeb || (!Platform.isIOS && !Platform.isAndroid)) {
+      return <dynamic, dynamic>{'event': 'unsupportedPlatform'};
     }
     return await WebRTC.invokeMethod<Map<dynamic, dynamic>, dynamic>(
           'pipDebugState',
@@ -136,14 +143,14 @@ class WebRTCPictureInPicture {
   }
 
   static Future<void> stop() async {
-    if (kIsWeb || !Platform.isIOS) {
+    if (kIsWeb || (!Platform.isIOS && !Platform.isAndroid)) {
       return;
     }
     await WebRTC.invokeMethod<void, dynamic>('pipStop');
   }
 
   static Future<void> dispose() async {
-    if (kIsWeb || !Platform.isIOS) {
+    if (kIsWeb || (!Platform.isIOS && !Platform.isAndroid)) {
       return;
     }
     await WebRTC.invokeMethod<void, dynamic>('pipDispose');

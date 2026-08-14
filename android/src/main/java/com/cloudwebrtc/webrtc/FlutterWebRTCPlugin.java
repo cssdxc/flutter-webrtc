@@ -130,7 +130,10 @@ public class FlutterWebRTCPlugin implements FlutterPlugin, ActivityAware, EventC
     private void startListening(final Context context, BinaryMessenger messenger,
                                 TextureRegistry textureRegistry) {
         AudioSwitchManager.instance = new AudioSwitchManager(context);
-        methodCallHandler = new MethodCallHandlerImpl(context, messenger, textureRegistry);
+        final FlutterRTCPictureInPictureController pictureInPictureController =
+                new FlutterRTCPictureInPictureController(messenger);
+        methodCallHandler = new MethodCallHandlerImpl(
+                context, messenger, textureRegistry, pictureInPictureController);
         methodChannel = new MethodChannel(messenger, "FlutterWebRTC.Method");
         methodChannel.setMethodCallHandler(methodCallHandler);
         eventChannel = new EventChannel( messenger,"FlutterWebRTC.Event");
@@ -145,6 +148,7 @@ public class FlutterWebRTCPlugin implements FlutterPlugin, ActivityAware, EventC
     }
 
     private void stopListening() {
+        methodCallHandler.setActivity(null);
         methodCallHandler.dispose();
         methodCallHandler = null;
         methodChannel.setMethodCallHandler(null);
