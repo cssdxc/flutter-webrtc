@@ -166,7 +166,7 @@ final class FlutterRTCPictureInPictureController {
     if (width != null && height != null && width > 0 && height > 0) {
       return new Rational(width, height);
     }
-    return new Rational(16, 9);
+    return new Rational(9, 16);
   }
 
   private void startStatePolling() {
