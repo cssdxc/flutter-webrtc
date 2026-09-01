@@ -35,6 +35,7 @@
 
 #import "LocalTrack.h"
 #import "LocalAudioTrack.h"
+#import "FlutterRTCAudioSink.h"
 #import "LocalVideoTrack.h"
 
 #if DEBUG
@@ -118,18 +119,42 @@ void postEvent(FlutterEventSink _Nullable sink, id _Nullable event) {
     });
 }
 
-#if TARGET_OS_IPHONE
+@interface FlutterWebRTCAudioPcmEventHandler : NSObject <FlutterStreamHandler>
+@property(nonatomic, copy) void (^onListen)(FlutterEventSink sink);
+@property(nonatomic, copy) void (^onCancel)(void);
+@end
+
+@implementation FlutterWebRTCAudioPcmEventHandler
+- (FlutterError*)onListenWithArguments:(id)arguments eventSink:(FlutterEventSink)sink {
+  if (self.onListen != nil) self.onListen(sink);
+  return nil;
+}
+- (FlutterError*)onCancelWithArguments:(id)arguments {
+  if (self.onCancel != nil) self.onCancel();
+  return nil;
+}
+@end
+
 @interface FlutterWebRTCPlugin ()
+#if TARGET_OS_IPHONE
 - (FlutterRTCPictureInPictureController*)pictureInPictureControllerCreatingIfNeeded
     API_AVAILABLE(ios(15.0));
-@end
 #endif
+- (void)setPersistentAudioPcmCaptureEnabled:(BOOL)enabled
+                                 completion:(void (^ _Nullable)(NSInteger result))completion;
+- (void)closeAllAudioPcmSinks;
+@end
 
 @implementation FlutterWebRTCPlugin {
 #pragma clang diagnostic pop
   FlutterMethodChannel* _methodChannel;
   FlutterEventSink _eventSink;
   FlutterEventChannel* _eventChannel;
+  FlutterEventChannel* _audioPcmEventChannel;
+  FlutterEventSink _audioPcmEventSink;
+  FlutterWebRTCAudioPcmEventHandler* _audioPcmEventHandler;
+  NSMutableDictionary<NSString*, FlutterRTCAudioSink*>* _pcmAudioSinks;
+  dispatch_queue_t _audioPcmControlQueue;
   id _registry;
   id _messenger;
   id _textures;
@@ -242,6 +267,24 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
   FlutterEventChannel* eventChannel =
       [FlutterEventChannel eventChannelWithName:@"FlutterWebRTC.Event" binaryMessenger:messenger];
   [eventChannel setStreamHandler:self];
+  FlutterEventChannel* audioPcmEventChannel =
+      [FlutterEventChannel eventChannelWithName:@"FlutterWebRTC.AudioPcm"
+                                binaryMessenger:messenger];
+  FlutterWebRTCAudioPcmEventHandler* audioPcmEventHandler =
+      [[FlutterWebRTCAudioPcmEventHandler alloc] init];
+  __weak FlutterWebRTCPlugin* weakSelf = self;
+  audioPcmEventHandler.onListen = ^(FlutterEventSink sink) {
+    FlutterWebRTCPlugin* strongSelf = weakSelf;
+    if (strongSelf == nil) return;
+    strongSelf->_audioPcmEventSink = sink;
+  };
+  audioPcmEventHandler.onCancel = ^{
+    FlutterWebRTCPlugin* strongSelf = weakSelf;
+    if (strongSelf == nil) return;
+    strongSelf->_audioPcmEventSink = nil;
+    [strongSelf closeAllAudioPcmSinks];
+  };
+  [audioPcmEventChannel setStreamHandler:audioPcmEventHandler];
 
   if (self) {
     _methodChannel = channel;
@@ -251,6 +294,12 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
     _speakerOn = NO;
     _speakerOnButPreferBluetooth = NO;
     _eventChannel = eventChannel;
+    _audioPcmEventChannel = audioPcmEventChannel;
+    _audioPcmEventHandler = audioPcmEventHandler;
+    _pcmAudioSinks = [NSMutableDictionary new];
+    _audioPcmControlQueue = dispatch_queue_create(
+        "com.cloudwebrtc.flutter-webrtc.audio-pcm-control",
+        DISPATCH_QUEUE_SERIAL);
     _audioManager = AudioManager.sharedInstance;
 
 #if TARGET_OS_IPHONE
@@ -305,6 +354,8 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
     peerConnection.eventSink = nil;
   }
   _eventSink = nil;
+  _audioPcmEventSink = nil;
+  [self closeAllAudioPcmSinks];
 }
 
 #pragma mark - FlutterStreamHandler methods
@@ -335,6 +386,45 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
     postEvent(self.eventSink, @{@"event" : @"onDeviceChange"});
   }
 #endif
+}
+
+- (void)setPersistentAudioPcmCaptureEnabled:(BOOL)enabled
+                                 completion:(void (^ _Nullable)(NSInteger result))completion {
+  RTCAudioDeviceModule* adm = _peerConnectionFactory.audioDeviceModule;
+  if (adm == nil) {
+    if (completion != nil) completion(-1);
+    return;
+  }
+
+  dispatch_async(_audioPcmControlQueue, ^{
+    NSInteger result = [adm setRecordingAlwaysPreparedMode:enabled];
+    if (result == 0 && enabled) {
+      result = [adm initAndStartRecording];
+    }
+    NSLog(@"[SUR-REC][darwin] persistent ADM capture %@ result=%ld "
+           "prepared=%d recording=%d engineRunning=%d",
+          enabled ? @"enabled" : @"released",
+          (long)result,
+          adm.isRecordingAlwaysPreparedMode,
+          adm.isRecording,
+          adm.isEngineRunning);
+    if (completion != nil) {
+      dispatch_async(dispatch_get_main_queue(), ^{
+        completion(result);
+      });
+    }
+  });
+}
+
+- (void)closeAllAudioPcmSinks {
+  BOOL hadSinks = _pcmAudioSinks.count > 0;
+  for (FlutterRTCAudioSink* sink in _pcmAudioSinks.allValues) {
+    [sink close];
+  }
+  [_pcmAudioSinks removeAllObjects];
+  if (hadSinks && _audioPcmControlQueue != nil) {
+    [self setPersistentAudioPcmCaptureEnabled:NO completion:nil];
+  }
 }
 
 -(void) initLoggerCallback:(RTCLoggingSeverity)severity {
@@ -820,6 +910,77 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
       track.isEnabled = enabled.boolValue;
     }
     result(nil);
+  } else if ([ @"startLocalAudioPcmCapture" isEqualToString:call.method]) {
+    NSDictionary* argsMap = call.arguments;
+    NSString* trackId = argsMap[@"trackId"];
+    if (![trackId isKindOfClass:[NSString class]] || trackId.length == 0) {
+      result([FlutterError errorWithCode:@"startLocalAudioPcmCapture"
+                                 message:@"Audio track ID is required"
+                                 details:nil]);
+      return;
+    }
+    if (_audioPcmEventSink == nil) {
+      result([FlutterError errorWithCode:@"startLocalAudioPcmCapture"
+                                 message:@"Audio PCM listener is not attached"
+                                 details:nil]);
+      return;
+    }
+    FlutterRTCAudioSink* oldSink = _pcmAudioSinks[trackId];
+    [oldSink close];
+    FlutterRTCAudioSink* sink = [[FlutterRTCAudioSink alloc]
+        initWithAudioTrack:nil
+        useLocalCapture:YES];
+    __weak FlutterWebRTCPlugin* weakSelf = self;
+    sink.pcmCallback = ^(const float* samples, size_t sampleCount,
+                         int sampleRate, size_t channels) {
+      FlutterWebRTCPlugin* strongSelf = weakSelf;
+      if (strongSelf == nil || strongSelf->_audioPcmEventSink == nil) return;
+      NSData* data = [NSData dataWithBytes:samples
+                                    length:sampleCount * sizeof(float)];
+      NSDictionary* event = @{
+        @"trackId": trackId,
+        @"data": data,
+        @"bitsPerSample": @(32),
+        @"sampleRate": @(sampleRate),
+        @"channels": @(channels),
+        @"frames": @(sampleCount / (channels == 0 ? 1 : channels)),
+      };
+      postEvent(strongSelf->_audioPcmEventSink, event);
+    };
+    _pcmAudioSinks[trackId] = sink;
+    [self setPersistentAudioPcmCaptureEnabled:YES
+                                   completion:^(NSInteger admResult) {
+      if (admResult == 0) {
+        result(nil);
+        return;
+      }
+      if (self->_pcmAudioSinks[trackId] == sink) {
+        [sink close];
+        [self->_pcmAudioSinks removeObjectForKey:trackId];
+      }
+      if (self->_pcmAudioSinks.count == 0) {
+        [self setPersistentAudioPcmCaptureEnabled:NO completion:nil];
+      }
+      result([FlutterError errorWithCode:@"startLocalAudioPcmCapture"
+                                 message:[NSString stringWithFormat:
+                                     @"Unable to keep WebRTC ADM recording: %ld",
+                                     (long)admResult]
+                                 details:nil]);
+    }];
+  } else if ([ @"stopLocalAudioPcmCapture" isEqualToString:call.method]) {
+    NSString* trackId = ((NSDictionary*)call.arguments)[@"trackId"];
+    FlutterRTCAudioSink* sink = _pcmAudioSinks[trackId];
+    [sink close];
+    [_pcmAudioSinks removeObjectForKey:trackId];
+    if (sink != nil && _pcmAudioSinks.count == 0) {
+      [self setPersistentAudioPcmCaptureEnabled:NO
+                                     completion:^(__unused NSInteger admResult) {
+        [self deactiveRtcAudioSession];
+        result(nil);
+      }];
+    } else {
+      result(nil);
+    }
   } else if ([@"mediaStreamAddTrack" isEqualToString:call.method]) {
     NSDictionary* argsMap = call.arguments;
     NSString* streamId = argsMap[@"streamId"];
@@ -876,6 +1037,12 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
   } else if ([@"trackDispose" isEqualToString:call.method]) {
     NSDictionary* argsMap = call.arguments;
     NSString* trackId = argsMap[@"trackId"];
+    FlutterRTCAudioSink* pcmSink = _pcmAudioSinks[trackId];
+    [pcmSink close];
+    [_pcmAudioSinks removeObjectForKey:trackId];
+    if (pcmSink != nil && _pcmAudioSinks.count == 0) {
+      [self setPersistentAudioPcmCaptureEnabled:NO completion:nil];
+    }
     BOOL audioTrack = NO;
     for (NSString* streamId in self.localStreams) {
       RTCMediaStream* stream = [self.localStreams objectForKey:streamId];
@@ -2077,6 +2244,7 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
 }
 
 - (void)dealloc {
+  [self closeAllAudioPcmSinks];
 #if TARGET_OS_IPHONE
   if (@available(iOS 15.0, *)) {
     FlutterRTCPictureInPictureController* pipController =
@@ -2198,7 +2366,9 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
   if (!self.audioSessionManagementEnabled) {
     return;
   }
-  if (![self hasLocalAudioTrack] && self.peerConnections.count == 0) {
+  if (_pcmAudioSinks.count == 0 &&
+      ![self hasLocalAudioTrack] &&
+      self.peerConnections.count == 0) {
     [AudioUtils deactiveRtcAudioSession];
   }
 #endif

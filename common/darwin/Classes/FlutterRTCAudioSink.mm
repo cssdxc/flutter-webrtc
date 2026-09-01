@@ -16,6 +16,9 @@
     BOOL _usesLocalCapture;
     BOOL _loggedFormat;
     int _dataBufferErrorCount;
+    NSMutableData *_pcmBatchData;
+    int _pcmBatchSampleRate;
+    size_t _pcmBatchChannels;
 }
 
 - (instancetype) initWithAudioTrack:(RTCAudioTrack* )audio {
@@ -30,13 +33,18 @@
     _usesLocalCapture = useLocalCapture;
     _loggedFormat = NO;
     _dataBufferErrorCount = 0;
+    _pcmBatchData = [NSMutableData data];
+    _pcmBatchSampleRate = 0;
+    _pcmBatchChannels = 0;
     _audioTrack = audio;
     if (_usesLocalCapture) {
         [AudioManager.sharedInstance addLocalAudioRenderer:self];
         NSLog(@"[SUR-REC][ios] local capture renderer attached track=%@", _audioTrack);
-    } else {
+    } else if (_audioTrack != nil) {
         [_audioTrack addRenderer:self];
         NSLog(@"[SUR-REC][ios] remote track renderer attached track=%@", _audioTrack);
+    } else {
+        NSLog(@"[SUR-REC][ios] remote audio renderer skipped: track unavailable");
     }
     return self;
 }
@@ -46,16 +54,15 @@
         return;
     }
     _closed = YES;
-    if (_audioTrack != nil) {
-        if (_usesLocalCapture) {
-            [AudioManager.sharedInstance removeLocalAudioRenderer:self];
-            NSLog(@"[SUR-REC][ios] local capture renderer detached track=%@", _audioTrack);
-        } else {
+    if (_usesLocalCapture) {
+        [AudioManager.sharedInstance removeLocalAudioRenderer:self];
+        NSLog(@"[SUR-REC][ios] local capture renderer detached track=%@", _audioTrack);
+    } else if (_audioTrack != nil) {
             [_audioTrack removeRenderer:self];
             NSLog(@"[SUR-REC][ios] remote track renderer detached track=%@", _audioTrack);
-        }
-        _audioTrack = nil;
     }
+    _audioTrack = nil;
+    [_pcmBatchData setLength:0];
 }
 
 - (CMSampleTimingInfo)nextAudioTimingWithSampleRate:(int)sampleRate
@@ -236,6 +243,28 @@
                   (int)bufferStatus,
                   (int)blockStatus,
                   (int)dataStatus);
+        }
+    }
+
+    if (dataStatus == noErr && buffer != NULL && self.pcmCallback != nil) {
+        int sampleRate = (int)streamDescription.mSampleRate;
+        if (_pcmBatchSampleRate != sampleRate ||
+            _pcmBatchChannels != channelCount) {
+            [_pcmBatchData setLength:0];
+            _pcmBatchSampleRate = sampleRate;
+            _pcmBatchChannels = channelCount;
+        }
+        [_pcmBatchData appendBytes:target length:sampleCount * sizeof(float)];
+        size_t targetSamples = (size_t)MAX(1, sampleRate / 10) * channelCount;
+        size_t targetBytes = targetSamples * sizeof(float);
+        while (_pcmBatchData.length >= targetBytes) {
+            self.pcmCallback((const float *)_pcmBatchData.bytes,
+                             targetSamples,
+                             sampleRate,
+                             channelCount);
+            [_pcmBatchData replaceBytesInRange:NSMakeRange(0, targetBytes)
+                                     withBytes:NULL
+                                        length:0];
         }
     }
 

@@ -45,11 +45,13 @@ public class FlutterWebRTCPlugin implements FlutterPlugin, ActivityAware, EventC
     private LifeCycleObserver observer;
     private Lifecycle lifecycle;
     private EventChannel eventChannel;
+    private EventChannel audioPcmEventChannel;
 
     // eventSink is static because FlutterWebRTCPlugin can be instantiated multiple times
     // but the onListen(Object, EventChannel.EventSink) event only fires once for the first
     // FlutterWebRTCPlugin instance, so for the next instances eventSink will be == null
     public static EventChannel.EventSink eventSink;
+    public static EventChannel.EventSink audioPcmEventSink;
 
     public FlutterWebRTCPlugin() {
         sharedSingleton = this;
@@ -138,6 +140,21 @@ public class FlutterWebRTCPlugin implements FlutterPlugin, ActivityAware, EventC
         methodChannel.setMethodCallHandler(methodCallHandler);
         eventChannel = new EventChannel( messenger,"FlutterWebRTC.Event");
         eventChannel.setStreamHandler(this);
+        audioPcmEventChannel = new EventChannel(messenger, "FlutterWebRTC.AudioPcm");
+        audioPcmEventChannel.setStreamHandler(new EventChannel.StreamHandler() {
+            @Override
+            public void onListen(Object arguments, EventChannel.EventSink events) {
+                audioPcmEventSink = new AnyThreadSink(events);
+            }
+
+            @Override
+            public void onCancel(Object arguments) {
+                audioPcmEventSink = null;
+                if (methodCallHandler != null) {
+                    methodCallHandler.stopAllLocalAudioPcmCaptures();
+                }
+            }
+        });
         AudioSwitchManager.instance.audioDeviceChangeListener = (devices, currentDevice) -> {
             Log.w(TAG, "audioFocusChangeListener " + devices+ " " + currentDevice);
             ConstraintsMap params = new ConstraintsMap();
@@ -153,6 +170,8 @@ public class FlutterWebRTCPlugin implements FlutterPlugin, ActivityAware, EventC
         methodCallHandler = null;
         methodChannel.setMethodCallHandler(null);
         eventChannel.setStreamHandler(null);
+        audioPcmEventChannel.setStreamHandler(null);
+        audioPcmEventSink = null;
         if (AudioSwitchManager.instance != null) {
             Log.d(TAG, "Stopping the audio manager...");
             AudioSwitchManager.instance.stop();

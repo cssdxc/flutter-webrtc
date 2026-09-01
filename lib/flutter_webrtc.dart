@@ -19,6 +19,7 @@ export 'src/native/utils.dart'
 export 'src/native/adapter_type.dart';
 export 'src/native/camera_utils.dart';
 export 'src/native/audio_management.dart';
+export 'src/native/audio_pcm.dart';
 export 'src/native/picture_in_picture.dart'
     if (dart.library.js_interop) 'src/web/picture_in_picture.dart';
 export 'src/native/android/audio_configuration.dart';

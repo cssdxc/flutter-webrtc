@@ -30,6 +30,7 @@ import com.cloudwebrtc.webrtc.audio.AudioUtils;
 import com.cloudwebrtc.webrtc.audio.LocalAudioTrack;
 import com.cloudwebrtc.webrtc.audio.PlaybackSamplesReadyCallbackAdapter;
 import com.cloudwebrtc.webrtc.audio.RecordSamplesReadyCallbackAdapter;
+import com.cloudwebrtc.webrtc.audio.StandaloneAudioCaptureController;
 import com.cloudwebrtc.webrtc.record.AudioChannel;
 import com.cloudwebrtc.webrtc.record.FrameCapturer;
 import com.cloudwebrtc.webrtc.utils.AnyThreadResult;
@@ -115,6 +116,7 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
   private final Map<String, MediaStream> localStreams = new HashMap<>();
   private final Map<String, LocalTrack> localTracks = new HashMap<>();
   private final LongSparseArray<FlutterRTCVideoRenderer> renders = new LongSparseArray<>();
+  private final StandaloneAudioCaptureController pcmAudioCaptureController;
 
   public RecordSamplesReadyCallbackAdapter recordSamplesReadyCallbackAdapter;
 
@@ -169,6 +171,27 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
     this.textures = textureRegistry;
     this.messenger = messenger;
     this.pictureInPictureController = pictureInPictureController;
+    this.pcmAudioCaptureController = new StandaloneAudioCaptureController(context);
+  }
+
+  void startLocalAudioPcmCapture(String trackId, EventChannel.EventSink eventSink) {
+    stopLocalAudioPcmCapture(trackId);
+    LocalTrack track;
+    synchronized (localTracks) {
+      track = localTracks.get(trackId);
+    }
+    if (!(track instanceof LocalAudioTrack)) {
+      throw new IllegalArgumentException("Local audio track not found: " + trackId);
+    }
+    pcmAudioCaptureController.start(trackId, eventSink);
+  }
+
+  void stopLocalAudioPcmCapture(String trackId) {
+    pcmAudioCaptureController.stop(trackId);
+  }
+
+  void stopAllLocalAudioPcmCaptures() {
+    pcmAudioCaptureController.stopAll();
   }
 
   static private void resultError(String method, String error, Result result) {
@@ -178,6 +201,8 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
   }
 
   void dispose() {
+    stopAllLocalAudioPcmCaptures();
+    pcmAudioCaptureController.dispose();
     for (final MediaStream mediaStream : localStreams.values()) {
       try {
         streamDispose(mediaStream);
@@ -227,6 +252,8 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
                     .createInitializationOptions());
 
     getUserMediaImpl = new GetUserMediaImpl(this, context);
+    pcmAudioCaptureController.setStandaloneSamplesCallback(
+            getUserMediaImpl.inputSamplesInterceptor);
 
     cameraUtils = new CameraUtils(getUserMediaImpl, activity);
 
@@ -309,6 +336,7 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
     audioDeviceModuleBuilder.setPlaybackSamplesReadyCallback(playbackSamplesReadyCallbackAdapter);
 
     recordSamplesReadyCallbackAdapter.addCallback(getUserMediaImpl.inputSamplesInterceptor);
+    recordSamplesReadyCallbackAdapter.addCallback(pcmAudioCaptureController);
 
     recordSamplesReadyCallbackAdapter.addCallback(new JavaAudioDeviceModule.SamplesReadyCallback() {
       @Override
@@ -672,6 +700,26 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
         Boolean enabled = call.argument("enabled");
         String peerConnectionId = call.argument("peerConnectionId");
         mediaStreamTrackSetEnabled(trackId, enabled, peerConnectionId);
+        result.success(null);
+        break;
+      }
+      case "startLocalAudioPcmCapture": {
+        String trackId = call.argument("trackId");
+        if (FlutterWebRTCPlugin.audioPcmEventSink == null) {
+          resultError("startLocalAudioPcmCapture", "Audio PCM listener is not attached", result);
+          break;
+        }
+        try {
+          startLocalAudioPcmCapture(trackId, FlutterWebRTCPlugin.audioPcmEventSink);
+          result.success(null);
+        } catch (Exception e) {
+          resultError("startLocalAudioPcmCapture", e.getMessage(), result);
+        }
+        break;
+      }
+      case "stopLocalAudioPcmCapture": {
+        String trackId = call.argument("trackId");
+        stopLocalAudioPcmCapture(trackId);
         result.success(null);
         break;
       }
@@ -1829,6 +1877,7 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
   }
 
   public void trackDispose(final String trackId) {
+    stopLocalAudioPcmCapture(trackId);
     LocalTrack track;
     synchronized (localTracks) {
       track = localTracks.get(trackId);
@@ -1994,6 +2043,9 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
     }
     PeerConnection peerConnection = getPeerConnection(id);
     if (peerConnection != null) {
+      if (!mediaStream.audioTracks.isEmpty()) {
+        pcmAudioCaptureController.prepareForWebRtcCapture();
+      }
       boolean res = peerConnection.addStream(mediaStream);
       Log.d(TAG, "addStream" + result);
       result.success(res);
@@ -2367,6 +2419,9 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
     if (pco == null || pco.getPeerConnection() == null) {
       resultError("addTrack", "peerConnection is null", result);
     } else {
+      if (track instanceof LocalAudioTrack) {
+        pcmAudioCaptureController.prepareForWebRtcCapture();
+      }
       pco.addTrack(track.track, streamIds, result);
     }
   }
@@ -2394,6 +2449,9 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
     if (pco == null || pco.getPeerConnection() == null) {
       resultError("addTransceiver", "peerConnection is null", result);
     } else {
+      if (track instanceof LocalAudioTrack) {
+        pcmAudioCaptureController.prepareForWebRtcCapture();
+      }
       pco.addTransceiver(track.track, transceiverInit, result);
     }
   }
@@ -2507,6 +2565,9 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
       }
 
       if(track != null) {
+        if (track instanceof LocalAudioTrack) {
+          pcmAudioCaptureController.prepareForWebRtcCapture();
+        }
         mediaStreamTrack = track.track;
       }
       pco.rtpSenderSetTrack(rtpSenderId, mediaStreamTrack, result, replace);

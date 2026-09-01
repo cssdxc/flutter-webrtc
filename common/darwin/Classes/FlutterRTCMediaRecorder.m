@@ -78,8 +78,8 @@ static const CMTimeScale kMotionRecordingTimeScale = 90000;
     [video addRenderer:self];
     framesCount = 0;
     if (audio != nil) {
-        // Device motion 录的是本机麦克风，必须接入 WebRTC 本地采集处理链。
-        // Viewer 手动录像录远端声音，继续使用远端 RTCAudioTrack renderer。
+        // Device motion 录像复用常驻 WebRTC ADM 的本机麦克风 PCM，不依赖
+        // Live PeerConnection。Viewer 手动录像录远端声音，继续使用远端 renderer。
         BOOL useLocalAudioCapture = [out.path containsString:@".motion_recording.mp4"];
         _audioSink = [[FlutterRTCAudioSink alloc] initWithAudioTrack:audio
                                                    useLocalCapture:useLocalAudioCapture];
