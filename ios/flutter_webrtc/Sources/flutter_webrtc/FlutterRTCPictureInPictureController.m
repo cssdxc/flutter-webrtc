@@ -131,7 +131,7 @@ API_AVAILABLE(ios(15.0))
   AVPictureInPictureController* controller =
       [[AVPictureInPictureController alloc] initWithContentSource:contentSource];
   controller.delegate = self;
-  controller.canStartPictureInPictureAutomaticallyFromInline = YES;
+  controller.canStartPictureInPictureAutomaticallyFromInline = NO;
 
   self.videoTrack = videoTrack;
   self.videoView = videoView;
