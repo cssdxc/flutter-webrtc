@@ -640,6 +640,7 @@ class VideoFileRenderer implements VideoSink, SamplesReadyCallback {
                 format.setInteger(MediaFormat.KEY_SAMPLE_RATE, audioSamples.getSampleRate());
                 format.setInteger(MediaFormat.KEY_BIT_RATE, 64 * 1024);
                 format.setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC);
+                format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, audioSamples.getData().length);
                 audioEncoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
                 audioEncoder.start();
                 audioInputBuffers = audioEncoder.getInputBuffers();
@@ -653,8 +654,12 @@ class VideoFileRenderer implements VideoSink, SamplesReadyCallback {
                 ByteBuffer buffer = audioInputBuffers[bufferIndex];
                 buffer.clear();
                 byte[] data = audioSamples.getData();
-                buffer.put(data);
-                audioEncoder.queueInputBuffer(bufferIndex, 0, data.length, presTime, 0);
+                if (data.length <= buffer.remaining()) {
+                    buffer.put(data);
+                    audioEncoder.queueInputBuffer(bufferIndex, 0, data.length, presTime, 0);
+                } else {
+                    audioEncoder.queueInputBuffer(bufferIndex, 0, 0, presTime, 0);
+                }
                 presTime += data.length * 125 / 12; // 1000000 microseconds / 48000hz / 2 bytes
             }
             drainAudio();
