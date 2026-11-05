@@ -7,6 +7,11 @@
 - (CMSampleTimingInfo)nextAudioTimingWithSampleRate:(int)sampleRate
                                     numberOfFrames:(size_t)numberOfFrames;
 - (void)updateFormatIfNeeded:(CMAudioFormatDescriptionRef)format;
+- (void)processPCMBuffer:(AVAudioPCMBuffer *)pcmBuffer;
+- (void)publishPCMSamples:(const float *)samples
+             sampleCount:(size_t)sampleCount
+              sampleRate:(int)sampleRate
+                channels:(size_t)channels;
 @end
 
 @implementation FlutterRTCAudioSink {
@@ -91,12 +96,29 @@
 
 - (void)renderPCMBuffer:(AVAudioPCMBuffer *)pcmBuffer
 {
+    // WebRTC audio threads do not drain temporary objects on each callback.
+    @autoreleasepool {
+        [self processPCMBuffer:pcmBuffer];
+    }
+}
+
+- (void)processPCMBuffer:(AVAudioPCMBuffer *)pcmBuffer
+{
     if (_closed || pcmBuffer == nil || pcmBuffer.frameLength == 0) {
         return;
     }
-
     const AudioStreamBasicDescription *sourceDescription = pcmBuffer.format.streamDescription;
     if (sourceDescription == NULL || sourceDescription->mSampleRate <= 0) {
+        return;
+    }
+
+    // Recorders read the format before enabling their writer callback. Keep
+    // the original capture timeline while avoiding unused sample buffers.
+    if (self.bufferCallback == nil && self.pcmCallback == nil && self.format != nil) {
+        if (pcmBuffer.floatChannelData != NULL || pcmBuffer.int16ChannelData != NULL) {
+            [self nextAudioTimingWithSampleRate:(int)sourceDescription->mSampleRate
+                                numberOfFrames:pcmBuffer.frameLength];
+        }
         return;
     }
 
@@ -153,6 +175,17 @@
         return;
     }
 
+    if (self.pcmCallback != nil) {
+        [self publishPCMSamples:target
+                   sampleCount:sampleCount
+                    sampleRate:(int)sourceDescription->mSampleRate
+                      channels:channelCount];
+    }
+    // Detection needs only PCM, not recording-only CoreMedia buffers.
+    if (self.bufferCallback == nil && self.pcmCallback != nil) {
+        return;
+    }
+
     AudioStreamBasicDescription streamDescription;
     bzero(&streamDescription, sizeof(streamDescription));
     streamDescription.mSampleRate = sourceDescription->mSampleRate;
@@ -190,10 +223,14 @@
     }
 
     [self updateFormatIfNeeded:formatDesc];
-
-    CMSampleBufferRef buffer = NULL;
     CMSampleTimingInfo timing = [self nextAudioTimingWithSampleRate:(int)streamDescription.mSampleRate
                                                      numberOfFrames:frameLength];
+    if (self.bufferCallback == nil) {
+        CFRelease(formatDesc);
+        return;
+    }
+
+    CMSampleBufferRef buffer = NULL;
     OSStatus bufferStatus = CMSampleBufferCreate(kCFAllocatorDefault,
                                                   NULL,
                                                   false,
@@ -246,28 +283,6 @@
         }
     }
 
-    if (dataStatus == noErr && buffer != NULL && self.pcmCallback != nil) {
-        int sampleRate = (int)streamDescription.mSampleRate;
-        if (_pcmBatchSampleRate != sampleRate ||
-            _pcmBatchChannels != channelCount) {
-            [_pcmBatchData setLength:0];
-            _pcmBatchSampleRate = sampleRate;
-            _pcmBatchChannels = channelCount;
-        }
-        [_pcmBatchData appendBytes:target length:sampleCount * sizeof(float)];
-        size_t targetSamples = (size_t)MAX(1, sampleRate / 10) * channelCount;
-        size_t targetBytes = targetSamples * sizeof(float);
-        while (_pcmBatchData.length >= targetBytes) {
-            self.pcmCallback((const float *)_pcmBatchData.bytes,
-                             targetSamples,
-                             sampleRate,
-                             channelCount);
-            [_pcmBatchData replaceBytesInRange:NSMakeRange(0, targetBytes)
-                                     withBytes:NULL
-                                        length:0];
-        }
-    }
-
     if (blockBuffer != NULL) {
         CFRelease(blockBuffer);
     }
@@ -276,6 +291,26 @@
     }
     if (formatDesc != NULL) {
         CFRelease(formatDesc);
+    }
+}
+
+- (void)publishPCMSamples:(const float *)samples
+             sampleCount:(size_t)sampleCount
+              sampleRate:(int)sampleRate
+                channels:(size_t)channels {
+    if (_pcmBatchSampleRate != sampleRate || _pcmBatchChannels != channels) {
+        [_pcmBatchData setLength:0];
+        _pcmBatchSampleRate = sampleRate;
+        _pcmBatchChannels = channels;
+    }
+    [_pcmBatchData appendBytes:samples length:sampleCount * sizeof(float)];
+    size_t targetSamples = (size_t)MAX(1, sampleRate / 10) * channels;
+    size_t targetBytes = targetSamples * sizeof(float);
+    while (_pcmBatchData.length >= targetBytes) {
+        self.pcmCallback((const float *)_pcmBatchData.bytes,
+                         targetSamples, sampleRate, channels);
+        [_pcmBatchData replaceBytesInRange:NSMakeRange(0, targetBytes)
+                                 withBytes:NULL length:0];
     }
 }
 

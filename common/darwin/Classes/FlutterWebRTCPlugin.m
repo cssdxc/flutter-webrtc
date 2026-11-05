@@ -931,10 +931,15 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
         initWithAudioTrack:nil
         useLocalCapture:YES];
     __weak FlutterWebRTCPlugin* weakSelf = self;
+    __weak FlutterRTCAudioSink* weakSink = sink;
+    // At most two 100 ms batches may await the Flutter platform thread.
+    // A busy UI must not retain an unbounded history of live microphone PCM.
+    dispatch_semaphore_t pendingPcmEvents = dispatch_semaphore_create(2);
     sink.pcmCallback = ^(const float* samples, size_t sampleCount,
                          int sampleRate, size_t channels) {
       FlutterWebRTCPlugin* strongSelf = weakSelf;
       if (strongSelf == nil || strongSelf->_audioPcmEventSink == nil) return;
+      if (dispatch_semaphore_wait(pendingPcmEvents, DISPATCH_TIME_NOW) != 0) return;
       NSData* data = [NSData dataWithBytes:samples
                                     length:sampleCount * sizeof(float)];
       NSDictionary* event = @{
@@ -945,7 +950,14 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
         @"channels": @(channels),
         @"frames": @(sampleCount / (channels == 0 ? 1 : channels)),
       };
-      postEvent(strongSelf->_audioPcmEventSink, event);
+      dispatch_async(dispatch_get_main_queue(), ^{
+        FlutterRTCAudioSink* activeSink = weakSink;
+        if (activeSink != nil && strongSelf->_pcmAudioSinks[trackId] == activeSink &&
+            strongSelf->_audioPcmEventSink != nil) {
+          strongSelf->_audioPcmEventSink(event);
+        }
+        dispatch_semaphore_signal(pendingPcmEvents);
+      });
     };
     _pcmAudioSinks[trackId] = sink;
     [self setPersistentAudioPcmCaptureEnabled:YES

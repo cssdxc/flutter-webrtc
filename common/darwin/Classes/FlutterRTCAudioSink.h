@@ -1,8 +1,9 @@
 #import <Foundation/Foundation.h>
 #import <CoreMedia/CoreMedia.h>
 #import <WebRTC/WebRTC.h>
+#import <WebRTC/RTCAudioRenderer.h>
 
-@interface FlutterRTCAudioSink : NSObject
+@interface FlutterRTCAudioSink : NSObject <RTCAudioRenderer>
 
 @property (nonatomic, copy) void (^bufferCallback)(CMSampleBufferRef);
 @property (nonatomic, copy) void (^pcmCallback)(const float *samples,

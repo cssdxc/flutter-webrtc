@@ -10,6 +10,7 @@
   size_t _sampleRateHz;
   size_t _channelCount;
   BOOL _loggedCaptureFormat;
+  AVAudioFormat* _pcmFormat;
 }
 
 - (instancetype)init {
@@ -76,13 +77,15 @@
   if (_channelCount > 0) {
     channelCount = (AVAudioChannelCount)MIN(_channelCount, audioBuffer.channels);
   }
-  AVAudioFormat* format =
-      [[AVAudioFormat alloc] initWithCommonFormat:AVAudioPCMFormatFloat32
-                                       sampleRate:sampleRate
-                                         channels:channelCount
-                                      interleaved:NO];
+  if (_pcmFormat == nil || _pcmFormat.sampleRate != sampleRate ||
+      _pcmFormat.channelCount != channelCount) {
+    _pcmFormat = [[AVAudioFormat alloc] initWithCommonFormat:AVAudioPCMFormatFloat32
+                                              sampleRate:sampleRate
+                                                channels:channelCount
+                                             interleaved:NO];
+  }
   AVAudioPCMBuffer* pcmBuffer =
-      [[AVAudioPCMBuffer alloc] initWithPCMFormat:format
+      [[AVAudioPCMBuffer alloc] initWithPCMFormat:_pcmFormat
                                     frameCapacity:(AVAudioFrameCount)audioBuffer.frames];
   if (!pcmBuffer) {
     NSLog(@"Failed to create AVAudioPCMBuffer");
@@ -115,15 +118,21 @@
 }
 
 - (void)audioProcessingProcess:(RTC_OBJC_TYPE(RTCAudioBuffer) *)audioBuffer {
-  os_unfair_lock_lock(&_lock);
-  for (id<ExternalAudioProcessingDelegate> processor in _processors) {
-    [processor audioProcessingProcess:audioBuffer];
-  }
+  // WebRTC invokes this on a long-lived native audio thread. Drain temporary
+  // Objective-C objects every 10 ms instead of retaining them for the session.
+  @autoreleasepool {
+    os_unfair_lock_lock(&_lock);
+    for (id<ExternalAudioProcessingDelegate> processor in _processors) {
+      [processor audioProcessingProcess:audioBuffer];
+    }
 
-  for (id<RTCAudioRenderer> renderer in _renderers) {
-    [renderer renderPCMBuffer:[self toPCMBuffer:audioBuffer]];
+    for (id<RTCAudioRenderer> renderer in _renderers) {
+      // Renderers receive writable PCM. Preserve their independent copies so
+      // an external renderer cannot change another consumer's audio.
+      [renderer renderPCMBuffer:[self toPCMBuffer:audioBuffer]];
+    }
+    os_unfair_lock_unlock(&_lock);
   }
-  os_unfair_lock_unlock(&_lock);
 }
 
 - (void)audioProcessingRelease {
